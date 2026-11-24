@@ -177,6 +177,94 @@ def test_switch_at_exact_period_boundary_takes_effect_immediately():
     assert (fr["start_ms"], fr["end_ms"]) == (200, 220)
 
 
+def test_idle_switch_wait_keeps_scheduling_frames_under_old_config():
+    """回归：出口空闲到点换配，等待首个旧周期边界期间仍按旧配置调度，不漏发可发帧。
+
+    period=100 reserve=40，150 到点（旧周期 [100,200) 的图像窗 [140,200) 内，出口空闲）：
+    - I2 在 150 到达、busy=30，[150,180) 整帧落在旧图像窗内，必须在等待期间照常发出；
+    - A3 在 105 到达（武装后的告警窗 [100,140) 内），[105,125) 也按旧配置发出；
+    - 切换在不早于 150 的首个旧周期边界 200 生效，新周期 [200,230) 告警窗内发 A2。
+    """
+    req = ReplayRequest(
+        period_ms=100,
+        reserve_ms=40,
+        alarm_deadline_ms=1000,
+        replay_end_ms=400,
+        frames=[
+            _frame("A1", "alarm", 0, 30),     # [0,30)
+            _frame("I1", "image", 40, 60),    # [40,100)
+            _frame("A3", "alarm", 105, 20),   # 武装前到点前的告警窗：[105,125)
+            _frame("I2", "image", 150, 30),   # 武装等待期间按旧配置：[150,180)
+            _frame("A2", "alarm", 150, 20),   # 排队保留，切换后 [200,220)
+        ],
+        switch_at_ms=150,
+        new_period_ms=80,
+        new_reserve_ms=30,
+    )
+    resp = simulate(req).model_dump()
+    fr = _by_id(resp)
+    assert resp["switch"]["state"] == "switched"
+    assert resp["switch"]["requested_at_ms"] == 150
+    assert resp["switch"]["effective_at_ms"] == 200
+    assert (fr["I2"]["start_ms"], fr["I2"]["end_ms"], fr["I2"]["status"]) == (150, 180, "sent")
+    assert (fr["A3"]["start_ms"], fr["A3"]["end_ms"], fr["A3"]["status"]) == (105, 125, "sent")
+    assert (fr["A2"]["start_ms"], fr["A2"]["end_ms"], fr["A2"]["status"]) == (200, 220, "sent")
+
+
+def test_frame_started_during_armed_wait_does_not_trigger_switch_at_completion():
+    """回归：等待换配期间才开送的帧，发完时刻不是周期边界也不得提前切换。"""
+    req = ReplayRequest(
+        period_ms=100,
+        reserve_ms=40,
+        alarm_deadline_ms=1000,
+        replay_end_ms=300,
+        frames=[_frame("I1", "image", 150, 30)],  # 150 武装，[150,180) 旧配置发送
+        switch_at_ms=150,
+        new_period_ms=80,
+        new_reserve_ms=30,
+    )
+    resp = simulate(req).model_dump()
+    fr = _by_id(resp)["I1"]
+    assert (fr["start_ms"], fr["end_ms"], fr["status"]) == (150, 180, "sent")
+    # 180 只是发完点、不是旧周期边界；生效时刻必须是 200
+    assert resp["switch"]["effective_at_ms"] == 200
+
+
+def test_frame_ending_exactly_at_switch_time_uses_idle_boundary_rule():
+    """计划时刻恰好发完一帧且发完点不是周期边界：按空闲规则等首个旧周期边界。"""
+    req = ReplayRequest(
+        period_ms=100,
+        reserve_ms=100,  # 全告警；30 不是周期边界
+        alarm_deadline_ms=1000,
+        replay_end_ms=250,
+        frames=[_frame("A1", "alarm", 0, 30)],  # [0,30)，30 恰好发完
+        switch_at_ms=30,
+        new_period_ms=50,
+        new_reserve_ms=25,
+    )
+    resp = simulate(req).model_dump()
+    assert resp["switch"]["requested_at_ms"] == 30
+    assert resp["switch"]["effective_at_ms"] == 100
+    assert (resp["effective_period_ms"], resp["effective_reserve_ms"]) == (50, 25)
+
+
+def test_armed_wait_boundary_not_earlier_than_switch_time():
+    """武装后遇到的边界若早于计划时刻（计划时刻前一帧恰在边界发完），不得提前切换。"""
+    req = ReplayRequest(
+        period_ms=100,
+        reserve_ms=100,
+        alarm_deadline_ms=1000,
+        replay_end_ms=300,
+        frames=[_frame("A1", "alarm", 0, 100)],  # [0,100)，100 边界发完，计划时刻 105
+        switch_at_ms=105,
+        new_period_ms=50,
+        new_reserve_ms=25,
+    )
+    resp = simulate(req).model_dump()
+    # 100 边界早于计划时刻 105，不生效；首个不早于 105 的旧边界是 200
+    assert resp["switch"]["effective_at_ms"] == 200
+
+
 # ---------------------------------------------------------------- 超时与终点
 def test_alarm_timeout_boundary_and_elapsed_calculation():
     """耗时 > 时限才算超时：等于时限不超时；未发完按重放终点计时。"""
@@ -267,6 +355,82 @@ def test_arrivals_at_end_are_not_arrived_and_default_ids():
     resp = simulate(req).model_dump()
     assert resp["frames"][0]["id"] == "F1"
     assert resp["frames"][0]["status"] == "not_arrived"
+
+
+def test_frame_crossing_end_admits_later_arrivals_as_queued_with_alarm_stats():
+    """回归：最后一帧发送中跨过终点，终点前到达但未开送的帧必须 queued 且告警计入汇总。
+
+    全告警周期 100：A_long [0,100) 正好发到终点（in_progress）；A_q 在 50 到达
+    （严格早于终点 100），须 queued，计时 100-50=50 > 时限 40 -> 超时；
+    A_end 在 100 到达 == 终点 -> not_arrived，不参与告警统计。
+    """
+    req = ReplayRequest(
+        period_ms=100,
+        reserve_ms=100,
+        alarm_deadline_ms=40,
+        replay_end_ms=100,
+        frames=[
+            _frame("A_long", "alarm", 0, 100),
+            _frame("A_q", "alarm", 50, 10),
+            _frame("A_end", "alarm", 100, 10),
+        ],
+    )
+    resp = simulate(req).model_dump()
+    fr = _by_id(resp)
+    assert fr["A_long"]["status"] == "in_progress"
+    assert fr["A_long"]["start_ms"] == 0 and fr["A_long"]["end_ms"] is None
+    assert fr["A_q"]["status"] == "queued"
+    assert fr["A_q"]["start_ms"] is None
+    assert fr["A_q"]["alarm_elapsed_ms"] == 50 and fr["A_q"]["timed_out"] is True
+    assert fr["A_end"]["status"] == "not_arrived"
+    assert fr["A_end"]["alarm_elapsed_ms"] is None and fr["A_end"]["timed_out"] is None
+    assert resp["stats"]["alarm_total"] == 2
+    assert resp["stats"]["alarm_timed_out"] == 2  # A_long 耗时 100、A_q 耗时 50，均 > 40
+    assert (resp["stats"]["in_progress"], resp["stats"]["queued"],
+            resp["stats"]["not_arrived"]) == (1, 1, 1)
+
+
+def test_never_started_head_blocking_admits_queued_alarms_before_end():
+    """回归：队首帧永远放不进时段时，终点前到达的后续告警同样须 queued 并计时到终点。"""
+    req = ReplayRequest(
+        period_ms=50,
+        reserve_ms=20,
+        alarm_deadline_ms=30,
+        replay_end_ms=120,
+        frames=[
+            _frame("A_big", "alarm", 0, 25),    # 告警窗仅 20ms，永远开不了送
+            _frame("A_small", "alarm", 60, 10),  # 被队首阻塞，终点前到达 -> queued
+            _frame("I1", "image", 20, 30),       # 异类不受影响 [20,50)
+        ],
+    )
+    resp = simulate(req).model_dump()
+    fr = _by_id(resp)
+    assert fr["A_big"]["status"] == "queued"
+    assert fr["A_small"]["status"] == "queued"
+    assert fr["A_small"]["alarm_elapsed_ms"] == 60 and fr["A_small"]["timed_out"] is True
+    assert (fr["I1"]["start_ms"], fr["I1"]["end_ms"]) == (20, 50)
+    assert resp["stats"]["alarm_total"] == 2 and resp["stats"]["alarm_timed_out"] == 2
+
+
+def test_image_frame_arriving_during_cross_end_transmission_is_queued():
+    """跨终点的在发帧阻塞异类：终点前到达的图像帧 queued（非告警，计时字段为 null）。"""
+    req = ReplayRequest(
+        period_ms=100,
+        reserve_ms=40,
+        alarm_deadline_ms=1000,
+        replay_end_ms=90,
+        frames=[
+            _frame("A1", "alarm", 0, 40),       # [0,40)
+            _frame("I_long", "image", 40, 50),  # [40,90) 正好发到终点，in_progress
+            _frame("I2", "image", 80, 10),      # 终点前到达，出口被占 -> queued
+        ],
+    )
+    resp = simulate(req).model_dump()
+    fr = _by_id(resp)
+    assert fr["I_long"]["status"] == "in_progress"
+    assert fr["I2"]["status"] == "queued"
+    assert fr["I2"]["alarm_elapsed_ms"] is None and fr["I2"]["timed_out"] is None
+    assert resp["stats"]["queued"] == 1 and resp["stats"]["in_progress"] == 1
 
 
 def test_reserve_zero_means_only_images():

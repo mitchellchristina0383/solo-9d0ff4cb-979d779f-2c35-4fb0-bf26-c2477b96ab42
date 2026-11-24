@@ -39,7 +39,12 @@ class ReplayRequest(BaseModel):
     alarm_deadline_ms: int = Field(ge=0, description="告警时限：从到达计时，耗时超过该值即超时")
     replay_end_ms: int = Field(ge=1, description="重放终点（毫秒，>=1），仿真区间为 [0, replay_end_ms)")
     switch_at_ms: int | None = Field(
-        default=None, ge=0, description="可选：计划换配时刻；到点若出口正在发帧，则等该帧发完再切换"
+        default=None,
+        ge=0,
+        description=(
+            "可选：计划换配时刻。到点若出口正在发帧则等该帧发完再切换；出口空闲（含恰好发完一帧）"
+            "则在不早于该时刻的首个旧周期边界切换，等待期间仍按旧配置调度"
+        ),
     )
     new_period_ms: int | None = Field(default=None, ge=1, description="换配后的新周期长度")
     new_reserve_ms: int | None = Field(default=None, ge=0, description="换配后的新告警预留时长")
